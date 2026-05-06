@@ -1,0 +1,51 @@
+DATASET_NAME: 'birds'
+EMBEDDING_DIM: 256       # D: dimension of text/image feature space
+GF_DIM: 32               # base number of filters in generator
+DF_DIM: 64               # base number of filters in discriminator
+Z_DIM: 100               # noise vector dimension
+R_NUM: 2                 # number of residual blocks per generator stage
+
+# Image sizes for the 3 generator stages
+TREE:
+  BRANCH_NUM: 3
+  BASE_SIZE: 64
+
+# Training
+TRAIN:
+  FLAG: True
+  NET_G: ''              # path to pretrained generator (empty = train from scratch)
+  NET_D: ''
+  ENCODER_LOSS:
+    SENT: True
+    WORD: True
+  SMOOTH:
+    GAMMA1: 5.0          # attention normalization factor (eq. 9)
+    GAMMA2: 5.0          # logsumexp scale for R(Q,D) (eq. 10)
+    GAMMA3: 10.0         # DAMSM softmax smoothing (eq. 11)
+    LAMBDA: 5.0          # weight of L_DAMSM in total generator loss (CUB=5, COCO=50)
+  DISCRIMINATOR_LR: 2e-4
+  GENERATOR_LR: 2e-4
+  ENCODER_LR: 2e-4
+  BATCH_SIZE: 10         # batch size for AttnGAN training
+  MAX_EPOCH: 600
+  SNAPSHOT_INTERVAL: 50  # save checkpoint every N epochs
+  DISPLAY_INTERVAL: 100  # log every N steps
+  PRETRAINED_MODEL: ''   # path to DAMSM encoders directory
+
+# DAMSM pretraining
+DAMSM:
+  BATCH_SIZE: 20
+  MAX_EPOCH: 120
+  LR: 2e-4
+  M: 50                  # batch pairs for DAMSM loss
+
+# Text encoder (bi-LSTM)
+TEXT:
+  CAPTIONS_PER_IMAGE: 10
+  WORDS_NUM: 18          # max caption length
+  EMBEDDING_DIM: 300     # word embedding dimension
+
+# Paths
+DATA_DIR: 'data/birds'
+OUTPUT_DIR: 'output'
+LOG_DIR: 'output/logs'
