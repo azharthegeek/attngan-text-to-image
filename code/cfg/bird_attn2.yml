@@ -46,6 +46,6 @@ TEXT:
   EMBEDDING_DIM: 300     # word embedding dimension
 
 # Paths
-DATA_DIR: 'data/birds'
+DATA_DIR: 'data/birds/birds'
 OUTPUT_DIR: 'output'
 LOG_DIR: 'output/logs'

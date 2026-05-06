@@ -43,7 +43,7 @@ acv-semester-project/
 
 ```bash
 pip install -r requirements.txt
-python -c "import nltk; nltk.download('punkt')"
+python -c "import nltk; nltk.download('punkt_tab')"
 ```
 
 ### 2. Download the CUB-200-2011 dataset
@@ -56,9 +56,20 @@ mkdir -p data/birds
 # From: http://www.vision.caltech.edu/visipedia/CUB-200-2011.html
 # Unzip images into data/birds/images/
 
-# Download text annotations (Reed et al. format, from StackGAN repo):
-# https://github.com/hanzhanggit/StackGAN
-# Place train/test split pickles and text captions under data/birds/
+# Download text annotations + train/test split pickles
+# (Reed et al. format — StackGAN Google Drive is now private; use DF-GAN mirror instead)
+#
+# Option A — DF-GAN mirror (~50 MB, Google Drive, no account needed):
+pip install gdown
+bash scripts/download_birds_text.sh
+#
+# Option B — Kaggle (requires free account + kaggle CLI):
+# kaggle datasets download -d somthirthabhowmk2001/text-to-image-cub-200-2011
+# unzip text-to-image-cub-200-2011.zip -d data/birds/
+#
+# Option C — If images/ already present and you only need the split pickles:
+# (text captions still required via Option A or B)
+# python scripts/generate_pickles.py
 ```
 
 **Expected layout:**
