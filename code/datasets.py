@@ -84,7 +84,8 @@ class CUBDataset(Dataset):
             with open(class_info_path, 'rb') as f:
                 class_info = pickle.load(f, encoding='latin1')
         else:
-            class_info = [0] * len(filenames)
+            # Extract class index from filename prefix, e.g. '002.Laysan_Albatross/...' → 2
+            class_info = [int(fn.split('.')[0]) for fn in filenames]
         return filenames, class_info
 
     # ------------------------------------------------------------------
