@@ -34,7 +34,7 @@ TRAIN:
 
 # DAMSM pretraining
 DAMSM:
-  BATCH_SIZE: 20
+  BATCH_SIZE: 48
   MAX_EPOCH: 120
   LR: 0.0002
   M: 50                  # batch pairs for DAMSM loss

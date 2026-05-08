@@ -141,45 +141,25 @@ def _word_level_scores(word_embs, local_feat, gamma1, gamma2):
     Compute R(Q_i, D_j) for all (i,j) pairs.
     Returns (batch, batch) score matrix where [i,j] = R(image_i, text_j).
     """
-    batch = word_embs.size(0)
-    T = word_embs.size(2)
-    D = word_embs.size(1)
+    e = F.normalize(word_embs.permute(0, 2, 1), p=2, dim=2)  # (B, T, D)
+    v = F.normalize(local_feat, p=2, dim=1)                   # (B, D, N)
 
-    scores = torch.zeros(batch, batch, device=word_embs.device)
+    # s[i,j,t,n] = dot(e[i,t], v[j,:,n])
+    # broadcast: (B,1,T,D) @ (1,B,D,N) → (B, B, T, N)
+    s = torch.matmul(e.unsqueeze(1), v.unsqueeze(0))
 
-    for i in range(batch):
-        # word features for text i: (D, T) → (T, D)
-        e = word_embs[i].t()                              # (T, D)
-        e = F.normalize(e, p=2, dim=1)
+    s_bar = F.softmax(s, dim=-1)                              # (B, B, T, N)
+    alpha  = F.softmax(gamma1 * s_bar, dim=-1)                # (B, B, T, N)
 
-        for j in range(batch):
-            # local features for image j: (D, N)
-            v = local_feat[j]                             # (D, N)
-            v = F.normalize(v, p=2, dim=0)
+    # c[i,j,t,:] = alpha[i,j,t,:] @ v[j].T
+    # (B,B,T,N) @ (1,B,N,D) → (B, B, T, D)
+    c = torch.matmul(alpha, v.permute(0, 2, 1).unsqueeze(0))
+    c = F.normalize(c, p=2, dim=-1)
 
-            # Similarity matrix s = e^T * v: (T, N)
-            s = torch.mm(e, v)                            # (T, N)
-
-            # Normalise over N (eq. 8)
-            s_bar = F.softmax(s, dim=1)                   # (T, N)
-
-            # Attention weights alpha: softmax(gamma1 * s_bar) over N
-            alpha = F.softmax(gamma1 * s_bar, dim=1)      # (T, N)
-
-            # Region context c_i = sum_j alpha_j * v_j: (T, D)
-            c = torch.mm(alpha, v.t())                    # (T, D)
-            c = F.normalize(c, p=2, dim=1)
-
-            # Cosine similarity R(c_i, e_i) per word: (T,)
-            r_words = (c * e).sum(dim=1)                  # (T,)
-
-            # Aggregate via logsumexp (eq. 10)
-            r = torch.log(torch.clamp(
-                torch.sum(torch.exp(gamma2 * r_words)), min=1e-8
-            )) / gamma2
-
-            scores[i, j] = r
-
+    r_words = (c * e.unsqueeze(1)).sum(dim=-1)                # (B, B, T)
+    scores = torch.log(torch.clamp(
+        torch.exp(gamma2 * r_words).sum(dim=-1), min=1e-8
+    )) / gamma2                                               # (B, B)
     return scores
 
 
@@ -192,11 +172,8 @@ def _sent_level_scores(global_feat, sent_emb):
 
 def _same_class_mask(class_ids, batch_size, device):
     """Create boolean mask: True where images belong to the same class."""
-    mask = torch.zeros(batch_size, batch_size, dtype=torch.bool, device=device)
-    for i in range(batch_size):
-        for j in range(batch_size):
-            if i != j and class_ids[i] == class_ids[j]:
-                mask[i, j] = True
+    mask = (class_ids.unsqueeze(0) == class_ids.unsqueeze(1))  # (B, B)
+    mask.fill_diagonal_(False)
     return mask
 
 

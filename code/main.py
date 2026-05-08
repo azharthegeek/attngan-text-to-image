@@ -14,8 +14,11 @@ import sys
 import time
 
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
@@ -61,29 +64,30 @@ def build_discriminators(cfg, device):
 # ---------------------------------------------------------------------------
 
 def update_discriminators(nets_d, optimizers_d, real_imgs, fake_imgs,
-                          sent_emb, wrong_imgs, device):
+                          sent_emb, wrong_imgs, device, scaler_d):
     """
     Update all discriminators for one batch.
     Each D_i sees real, fake and wrong (real img + mismatched caption).
     """
-    d_losses = []
-    for i, (d, opt_d) in enumerate(zip(nets_d, optimizers_d)):
-        real  = real_imgs[i].to(device)
-        fake  = fake_imgs[i].detach()    # do not backprop through G
-        wrong = wrong_imgs[i].to(device)
+    d_loss_sum = torch.zeros(1, device=device)
+    for d, opt_d, real, fake, wrong in zip(nets_d, optimizers_d,
+                                           real_imgs, fake_imgs, wrong_imgs):
+        fake = fake.detach()    # do not backprop through G
 
-        real_uncond, real_cond   = d(real,  sent_emb)
-        fake_uncond, fake_cond   = d(fake,  sent_emb)
-        wrong_uncond, wrong_cond = d(wrong, sent_emb)
+        with autocast():
+            real_uncond, real_cond   = d(real,  sent_emb)
+            fake_uncond, fake_cond   = d(fake,  sent_emb)
+            wrong_uncond, wrong_cond = d(wrong, sent_emb)
+            loss = discriminator_loss(real_uncond, real_cond,
+                                      fake_uncond, fake_cond,
+                                      wrong_cond)
 
-        loss = discriminator_loss(real_uncond, real_cond,
-                                  fake_uncond, fake_cond,
-                                  wrong_cond)
         opt_d.zero_grad()
-        loss.backward()
-        opt_d.step()
-        d_losses.append(loss.item())
-    return d_losses
+        scaler_d.scale(loss).backward()
+        scaler_d.step(opt_d)
+        d_loss_sum += loss.detach()
+    scaler_d.update()
+    return d_loss_sum / len(nets_d)    # tensor
 
 
 # ---------------------------------------------------------------------------
@@ -92,35 +96,35 @@ def update_discriminators(nets_d, optimizers_d, real_imgs, fake_imgs,
 
 def update_generator(g_net, nets_d, optimizer_g,
                      word_embs, sent_emb, local_feat, global_feat,
-                     class_ids, z, device, cfg):
+                     class_ids, z, device, cfg, scaler_g):
     """Update generator using adversarial + DAMSM + KL losses."""
-    fake_imgs, attn_maps, mu, log_var = g_net(z, sent_emb, word_embs)
+    with autocast():
+        fake_imgs, attn_maps, mu, log_var = g_net(z, sent_emb, word_embs)
 
-    g_loss_total = 0.0
-    for i, (fake, d) in enumerate(zip(fake_imgs, nets_d)):
-        uncond, cond = d(fake, sent_emb)
-        g_loss_total += generator_loss(uncond, cond)
+        g_loss_total = torch.zeros(1, device=device)
+        for fake, d in zip(fake_imgs, nets_d):
+            uncond, cond = d(fake, sent_emb)
+            g_loss_total = g_loss_total + generator_loss(uncond, cond)
 
-    # KL divergence from Conditioning Augmentation
-    kl = kl_loss(mu, log_var)
-    g_loss_total += kl
+        # KL divergence from Conditioning Augmentation
+        g_loss_total = g_loss_total + kl_loss(mu, log_var)
 
-    # DAMSM fine-grained matching loss on the final (highest-res) image
-    # We use the pretrained image encoder to get features of the fake image
-    # Note: image encoder is frozen during GAN training
-    damsm = damsm_loss(word_embs.detach(), sent_emb.detach(),
-                       local_feat.detach(), global_feat.detach(),
-                       class_ids, z.size(0),
-                       cfg.TRAIN.SMOOTH.GAMMA1,
-                       cfg.TRAIN.SMOOTH.GAMMA2,
-                       cfg.TRAIN.SMOOTH.GAMMA3)
-    g_loss_total += cfg.TRAIN.SMOOTH.LAMBDA * damsm
+        # DAMSM fine-grained matching loss
+        # Note: image encoder is frozen during GAN training
+        damsm = damsm_loss(word_embs.detach(), sent_emb.detach(),
+                           local_feat.detach(), global_feat.detach(),
+                           class_ids, z.size(0),
+                           cfg.TRAIN.SMOOTH.GAMMA1,
+                           cfg.TRAIN.SMOOTH.GAMMA2,
+                           cfg.TRAIN.SMOOTH.GAMMA3)
+        g_loss_total = g_loss_total + cfg.TRAIN.SMOOTH.LAMBDA * damsm
 
     optimizer_g.zero_grad()
-    g_loss_total.backward()
-    optimizer_g.step()
+    scaler_g.scale(g_loss_total).backward()
+    scaler_g.step(optimizer_g)
+    scaler_g.update()
 
-    return g_loss_total.item(), fake_imgs, attn_maps
+    return g_loss_total.detach(), fake_imgs, attn_maps
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +164,8 @@ def train(cfg, device, resume_path=''):
                            captions_per_image=cfg.TEXT.CAPTIONS_PER_IMAGE)
 
     train_loader = DataLoader(train_set, batch_size=cfg.TRAIN.BATCH_SIZE,
-                              shuffle=True, num_workers=4,
+                              shuffle=True, num_workers=8, pin_memory=True,
+                              persistent_workers=True,
                               collate_fn=collate_fn, drop_last=True)
 
     n_words = train_set.n_words
@@ -205,6 +210,11 @@ def train(cfg, device, resume_path=''):
     ]
 
     logger = Logger(os.path.join(log_dir, 'train_log.csv'))
+    writer = SummaryWriter(os.path.join(log_dir, 'tensorboard'))
+
+    scaler_g = GradScaler()
+    scaler_d = GradScaler()
+    global_step = 0
 
     # Fixed noise for reproducible samples
     fixed_z = sample_noise(cfg.TRAIN.BATCH_SIZE, cfg.Z_DIM, device)
@@ -216,23 +226,20 @@ def train(cfg, device, resume_path=''):
         for d in nets_d:
             d.train()
 
-        epoch_g_loss = 0.0
-        epoch_d_loss = 0.0
+        epoch_g_loss_t = torch.zeros(1, device=device)
+        epoch_d_loss_t = torch.zeros(1, device=device)
         t0 = time.time()
 
         for step, (imgs_batch, word_ids, lengths, class_ids, _) in enumerate(train_loader):
             # ---- Move to device ----
-            real_imgs  = [x.to(device) for x in imgs_batch]
-            word_ids   = word_ids.to(device)
-            class_ids  = class_ids.to(device)
+            real_imgs  = [x.to(device, non_blocking=True) for x in imgs_batch]
+            word_ids   = word_ids.to(device, non_blocking=True)
+            class_ids  = class_ids.to(device, non_blocking=True)
 
             # ---- Encode text ----
-            with torch.no_grad():
+            with torch.no_grad(), autocast():
                 word_embs, sent_emb = text_enc(word_ids, lengths)
                 # Image features from real high-res images for DAMSM loss
-                import torch.nn.functional as F
-                from torchvision import transforms
-                # Resize the 256×256 image to 299×299 for inception
                 real_299 = F.interpolate(real_imgs[-1], size=(299, 299),
                                          mode='bilinear', align_corners=False)
                 local_feat, global_feat = img_enc(real_299)
@@ -240,34 +247,40 @@ def train(cfg, device, resume_path=''):
             # ---- Sample noise ----
             z = sample_noise(real_imgs[0].size(0), cfg.Z_DIM, device)
 
-            # ---- Generate fake images ----
-            fake_imgs, attn_maps, mu, log_var = g_net(z, sent_emb, word_embs)
+            # ---- Generate fakes for discriminator (no G gradient needed here) ----
+            with torch.no_grad(), autocast():
+                fake_for_d, _, _, _ = g_net(z, sent_emb, word_embs)
 
             # ---- Wrong images (real + mismatched text) ----
             wrong_imgs = get_wrong_imgs(imgs_batch, device)
 
             # ---- Update Discriminators ----
-            d_losses = update_discriminators(
+            d_loss = update_discriminators(
                 nets_d, optimizers_d,
-                real_imgs, fake_imgs,
-                sent_emb, wrong_imgs, device)
+                real_imgs, fake_for_d,
+                sent_emb, wrong_imgs, device, scaler_d)
 
-            # ---- Update Generator ----
+            # ---- Update Generator (generates new fakes internally, with gradients) ----
             g_loss, fake_imgs, attn_maps = update_generator(
                 g_net, nets_d, optimizer_g,
                 word_embs, sent_emb, local_feat, global_feat,
-                class_ids, z, device, cfg)
+                class_ids, z, device, cfg, scaler_g)
 
-            epoch_g_loss += g_loss
-            epoch_d_loss += sum(d_losses) / len(d_losses)
+            epoch_g_loss_t += g_loss
+            epoch_d_loss_t += d_loss
 
             if step % cfg.TRAIN.DISPLAY_INTERVAL == 0:
+                writer.add_scalar('AttnGAN/g_loss_step', g_loss.item(), global_step)
+                writer.add_scalar('AttnGAN/d_loss_step', d_loss.item(), global_step)
                 print(f'[AttnGAN] Epoch {epoch:4d} Step {step:4d} '
-                      f'G {g_loss:.3f}  D {sum(d_losses)/len(d_losses):.3f}  '
+                      f'G {g_loss.item():.3f}  D {d_loss.item():.3f}  '
                       f'Time {time.time()-t0:.1f}s')
+            global_step += 1
 
-        avg_g = epoch_g_loss / len(train_loader)
-        avg_d = epoch_d_loss / len(train_loader)
+        avg_g = epoch_g_loss_t.item() / len(train_loader)
+        avg_d = epoch_d_loss_t.item() / len(train_loader)
+        writer.add_scalar('AttnGAN/g_loss_epoch', avg_g, epoch)
+        writer.add_scalar('AttnGAN/d_loss_epoch', avg_d, epoch)
         logger.log({'epoch': epoch, 'g_loss': avg_g, 'd_loss': avg_d})
 
         # Save sample images
@@ -282,12 +295,15 @@ def train(cfg, device, resume_path=''):
                     imgs,
                     os.path.join(sample_dir, f'epoch_{epoch:04d}_scale{scale}.png')
                 )
+                grid = (imgs[:8].clamp(-1, 1) + 1) / 2
+                writer.add_images(f'Generated/{scale}x{scale}', grid, epoch)
 
             # Save checkpoint
             save_models(g_net, nets_d, text_enc, img_enc, epoch, ckpt_dir)
             print(f'Saved checkpoint at epoch {epoch}')
 
     logger.close()
+    writer.close()
     print('Training complete.')
 
 
@@ -304,6 +320,7 @@ if __name__ == '__main__':
     if args.gpu >= 0 and torch.cuda.is_available():
         device = torch.device(f'cuda:{args.gpu}')
         torch.cuda.manual_seed(args.seed)
+        torch.backends.cudnn.benchmark = True
     else:
         device = torch.device('cpu')
         print('Warning: running on CPU.')

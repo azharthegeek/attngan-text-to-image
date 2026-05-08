@@ -16,7 +16,9 @@ import time
 import torch
 import torch.optim as optim
 import torchvision.transforms as T
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 # Make sure the code/ directory is on the path when calling from project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
@@ -130,10 +132,12 @@ def train_damsm(cfg, device):
                              captions_per_image=cfg.TEXT.CAPTIONS_PER_IMAGE)
 
     train_loader = DataLoader(train_set, batch_size=cfg.DAMSM.BATCH_SIZE,
-                              shuffle=True,  num_workers=4,
+                              shuffle=True,  num_workers=8, pin_memory=True,
+                              persistent_workers=True,
                               collate_fn=damsm_collate, drop_last=True)
     test_loader  = DataLoader(test_set,  batch_size=cfg.DAMSM.BATCH_SIZE,
-                              shuffle=False, num_workers=4,
+                              shuffle=False, num_workers=8, pin_memory=True,
+                              persistent_workers=True,
                               collate_fn=damsm_collate, drop_last=True)
 
     n_words = train_set.n_words
@@ -153,48 +157,58 @@ def train_damsm(cfg, device):
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
 
     logger = Logger(os.path.join(log_dir, 'train_log.csv'))
+    writer = SummaryWriter(os.path.join(log_dir, 'tensorboard'))
     best_loss = float('inf')
+    scaler = GradScaler()
+    global_step = 0
 
     for epoch in range(1, cfg.DAMSM.MAX_EPOCH + 1):
         text_enc.train()
         img_enc.train()
-        epoch_loss = 0.0
+        epoch_loss_t = torch.zeros(1, device=device)
         t0 = time.time()
 
         for step, (imgs, word_ids, lengths, class_ids, _) in enumerate(train_loader):
-            imgs      = imgs.to(device)
-            word_ids  = word_ids.to(device)
-            class_ids = class_ids.to(device)
+            imgs      = imgs.to(device, non_blocking=True)
+            word_ids  = word_ids.to(device, non_blocking=True)
+            class_ids = class_ids.to(device, non_blocking=True)
 
-            # Forward text encoder
-            word_embs, sent_emb = text_enc(word_ids, lengths)
+            with autocast():
+                # Forward text encoder
+                word_embs, sent_emb = text_enc(word_ids, lengths)
 
-            # Forward image encoder (resize already done in dataset)
-            local_feat, global_feat = img_enc(imgs)
+                # Forward image encoder (resize already done in dataset)
+                local_feat, global_feat = img_enc(imgs)
 
-            # DAMSM loss
-            loss = damsm_loss(word_embs, sent_emb,
-                              local_feat, global_feat,
-                              class_ids, imgs.size(0),
-                              cfg.TRAIN.SMOOTH.GAMMA1,
-                              cfg.TRAIN.SMOOTH.GAMMA2,
-                              cfg.TRAIN.SMOOTH.GAMMA3)
+                # DAMSM loss
+                loss = damsm_loss(word_embs, sent_emb,
+                                  local_feat, global_feat,
+                                  class_ids, imgs.size(0),
+                                  cfg.TRAIN.SMOOTH.GAMMA1,
+                                  cfg.TRAIN.SMOOTH.GAMMA2,
+                                  cfg.TRAIN.SMOOTH.GAMMA3)
 
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             # Clip gradients for stable RNN training
             torch.nn.utils.clip_grad_norm_(text_enc.parameters(), 0.25)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
-            epoch_loss += loss.item()
+            epoch_loss_t += loss.detach()
 
             if step % cfg.TRAIN.DISPLAY_INTERVAL == 0:
+                writer.add_scalar('DAMSM/loss_step', loss.item(), global_step)
                 print(f'[DAMSM] Epoch {epoch:3d} Step {step:4d} '
                       f'Loss {loss.item():.4f}  '
                       f'Time {time.time()-t0:.1f}s')
+            global_step += 1
 
         scheduler.step()
-        avg_loss = epoch_loss / len(train_loader)
+        avg_loss = epoch_loss_t.item() / len(train_loader)
+        writer.add_scalar('DAMSM/loss_epoch', avg_loss, epoch)
+        writer.add_scalar('DAMSM/lr', scheduler.get_last_lr()[0], epoch)
         logger.log({'epoch': epoch, 'train_loss': avg_loss})
         print(f'[DAMSM] Epoch {epoch} done | avg loss: {avg_loss:.4f}')
 
@@ -208,6 +222,7 @@ def train_damsm(cfg, device):
             save_damsm(text_enc, img_enc, epoch, out_dir)
 
     logger.close()
+    writer.close()
     print(f'DAMSM pretraining done. Encoders saved to {out_dir}')
 
 
@@ -224,6 +239,7 @@ if __name__ == '__main__':
     if args.gpu >= 0 and torch.cuda.is_available():
         device = torch.device(f'cuda:{args.gpu}')
         torch.cuda.manual_seed(args.seed)
+        torch.backends.cudnn.benchmark = True
     else:
         device = torch.device('cpu')
         print('Warning: running on CPU — this will be slow.')

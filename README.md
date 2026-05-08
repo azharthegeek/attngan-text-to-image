@@ -120,6 +120,33 @@ Checkpoints and sample images are saved to `output/`.
 
 ---
 
+## Monitoring Training
+
+Both training scripts write TensorBoard logs to `output/logs/`. You can start TensorBoard in a separate terminal **while training is running** or after it finishes:
+
+```bash
+tensorboard --logdir output/logs
+```
+
+Then open **http://localhost:6006** in your browser.
+
+| TensorBoard tab | What you will see |
+|---|---|
+| Scalars → `DAMSM/loss_step` | DAMSM loss at every logged step |
+| Scalars → `DAMSM/loss_epoch` | DAMSM average loss per epoch |
+| Scalars → `DAMSM/lr` | Learning rate schedule |
+| Scalars → `AttnGAN/g_loss_epoch` | Generator loss per epoch |
+| Scalars → `AttnGAN/d_loss_epoch` | Discriminator loss per epoch |
+| Images → `Generated/64x64` etc. | Sample bird images at all 3 scales (saved every 50 epochs) |
+
+**On a remote GPU server**, forward the port before opening the browser:
+
+```bash
+ssh -L 6006:localhost:6006 user@your-server
+```
+
+---
+
 ## Inference & Evaluation
 
 ### Generate from a text description
@@ -175,7 +202,7 @@ R@1 : 67.82%         (paper baseline on CUB)
 | Noise dimension z | 100 |
 | Feature dimension D | 256 |
 | Batch size (GAN) | 10 |
-| Batch size (DAMSM) | 20 |
+| Batch size (DAMSM) | 48 |
 | Learning rate | 2e-4 (Adam, β1=0.5) |
 | λ (DAMSM weight) | 5 (CUB) |
 | γ1, γ2 | 5 |
