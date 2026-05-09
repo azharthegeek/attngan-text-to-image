@@ -19,6 +19,53 @@ def load_config(cfg_path):
     return cfg
 
 
+def get_gpu_tier(device):
+    """Return tier label based on total VRAM: '4gb', '8gb', '16gb', or 'cpu'."""
+    if device.type != 'cuda':
+        return 'cpu'
+    total_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+    if total_gb <= 5:
+        return '4gb'
+    elif total_gb <= 10:
+        return '8gb'
+    return '16gb'
+
+
+def apply_gpu_memory_config(cfg, device):
+    """Override cfg in-place with tier-appropriate batch sizes, model dims, and worker counts."""
+    tier = get_gpu_tier(device)
+    tier_settings = {
+        'cpu':  dict(batch=2, damsm_batch=8,  workers=0, gf=16, df=32, stages=2, ckpt=True),
+        '4gb':  dict(batch=2, damsm_batch=16, workers=2, gf=16, df=32, stages=2, ckpt=True),
+        '8gb':  dict(batch=8, damsm_batch=32, workers=4, gf=32, df=64, stages=3, ckpt=False),
+        '16gb': dict(batch=16,damsm_batch=48, workers=8, gf=32, df=64, stages=3, ckpt=False),
+    }
+    s = tier_settings[tier]
+
+    orig_batch = cfg.TRAIN.BATCH_SIZE
+    cfg.TRAIN.BATCH_SIZE    = s['batch']
+    cfg.TRAIN.NUM_WORKERS   = s['workers']
+    cfg.DAMSM.BATCH_SIZE    = s['damsm_batch']
+    cfg.DAMSM.NUM_WORKERS   = s['workers']
+    cfg.GF_DIM              = s['gf']
+    cfg.DF_DIM              = s['df']
+    cfg.TREE.BRANCH_NUM     = s['stages']
+    cfg.USE_GRAD_CHECKPOINT = s['ckpt']
+
+    # Enable expandable allocator on small GPUs to reduce fragmentation OOMs
+    if tier in ('4gb', 'cpu'):
+        os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
+    total_label = (
+        f"{torch.cuda.get_device_properties(device).total_memory / (1024**3):.1f} GB"
+        if device.type == 'cuda' else 'CPU'
+    )
+    print(f"[GPU config] tier={tier} ({total_label}) | "
+          f"TRAIN batch {orig_batch}→{s['batch']}, stages={s['stages']}, "
+          f"GF={s['gf']}, DF={s['df']}, ckpt={s['ckpt']}, workers={s['workers']}")
+    return cfg
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------

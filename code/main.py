@@ -27,7 +27,8 @@ from damsm import RNN_ENCODER, CNN_ENCODER
 from model import G_NET, D_NET64, D_NET128, D_NET256
 from losses import generator_loss, discriminator_loss, kl_loss, damsm_loss
 from utils import (load_config, save_models, load_damsm,
-                   sample_noise, save_image_grid, Logger)
+                   sample_noise, save_image_grid, Logger,
+                   apply_gpu_memory_config)
 
 
 # ---------------------------------------------------------------------------
@@ -51,12 +52,12 @@ def parse_args():
 def build_discriminators(cfg, device):
     df_dim = cfg.DF_DIM
     ef_dim = cfg.EMBEDDING_DIM
-    nets_d = [
-        D_NET64(df_dim, ef_dim).to(device),
-        D_NET128(df_dim, ef_dim).to(device),
-        D_NET256(df_dim, ef_dim).to(device),
+    all_nets = [
+        D_NET64(df_dim, ef_dim),
+        D_NET128(df_dim, ef_dim),
+        D_NET256(df_dim, ef_dim),
     ]
-    return nets_d
+    return [net.to(device) for net in all_nets[:cfg.TREE.BRANCH_NUM]]
 
 
 # ---------------------------------------------------------------------------
@@ -163,9 +164,11 @@ def train(cfg, device, resume_path=''):
                            words_num=cfg.TEXT.WORDS_NUM,
                            captions_per_image=cfg.TEXT.CAPTIONS_PER_IMAGE)
 
+    nw = cfg.TRAIN.NUM_WORKERS
     train_loader = DataLoader(train_set, batch_size=cfg.TRAIN.BATCH_SIZE,
-                              shuffle=True, num_workers=8, pin_memory=True,
-                              persistent_workers=True,
+                              shuffle=True, num_workers=nw,
+                              pin_memory=(nw > 0),
+                              persistent_workers=(nw > 0),
                               collate_fn=collate_fn, drop_last=True)
 
     n_words = train_set.n_words
@@ -189,7 +192,8 @@ def train(cfg, device, resume_path=''):
                   gf_dim=cfg.GF_DIM,
                   ef_dim=cfg.EMBEDDING_DIM,
                   r_num=cfg.R_NUM,
-                  num_stages=cfg.TREE.BRANCH_NUM).to(device)
+                  num_stages=cfg.TREE.BRANCH_NUM,
+                  use_checkpoint=cfg.get('USE_GRAD_CHECKPOINT', False)).to(device)
 
     start_epoch = 1
     if resume_path and os.path.exists(resume_path):
@@ -261,6 +265,7 @@ def train(cfg, device, resume_path=''):
                 sent_emb, wrong_imgs, device, scaler_d)
 
             # ---- Update Generator (generates new fakes internally, with gradients) ----
+            torch.cuda.empty_cache()
             g_loss, fake_imgs, attn_maps = update_generator(
                 g_net, nets_d, optimizer_g,
                 word_embs, sent_emb, local_feat, global_feat,
@@ -286,11 +291,12 @@ def train(cfg, device, resume_path=''):
         # Save sample images
         if epoch % cfg.TRAIN.SNAPSHOT_INTERVAL == 0 or epoch == 1:
             g_net.eval()
-            with torch.no_grad():
+            with torch.no_grad(), autocast():
                 sample_imgs, _, _, _ = g_net(fixed_z, sent_emb[:fixed_z.size(0)],
                                              word_embs[:fixed_z.size(0)])
+            scales = [64, 128, 256][:cfg.TREE.BRANCH_NUM]
             for scale_idx, imgs in enumerate(sample_imgs):
-                scale = [64, 128, 256][scale_idx]
+                scale = scales[scale_idx]
                 save_image_grid(
                     imgs,
                     os.path.join(sample_dir, f'epoch_{epoch:04d}_scale{scale}.png')
@@ -326,4 +332,5 @@ if __name__ == '__main__':
         print('Warning: running on CPU.')
 
     print(f'Using device: {device}')
+    cfg = apply_gpu_memory_config(cfg, device)
     train(cfg, device, resume_path=args.resume)

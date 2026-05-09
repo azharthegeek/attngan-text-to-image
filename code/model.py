@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
+from torch.utils.checkpoint import checkpoint as ckpt_fn
 
 
 # ---------------------------------------------------------------------------
@@ -272,10 +273,11 @@ class G_NET(nn.Module):
     """
 
     def __init__(self, z_dim=100, ca_dim=100, gf_dim=32, ef_dim=256, r_num=2,
-                 num_stages=3):
+                 num_stages=3, use_checkpoint=False):
         super().__init__()
         self.ca_net = CA_NET(ef_dim, ca_dim)
         self.num_stages = num_stages
+        self.use_checkpoint = use_checkpoint
 
         # G0: gf_dim*8 hidden channels at 64×64 (Ngf//2 = gf_dim*4)
         self.g0 = INIT_STAGE_G(z_dim, ca_dim, gf_dim, r_num)
@@ -303,12 +305,18 @@ class G_NET(nn.Module):
         """
         c, mu, log_var = self.ca_net(sent_emb)    # conditioning vector
 
-        h, img0 = self.g0(z, c)
+        if self.use_checkpoint:
+            h, img0 = ckpt_fn(self.g0, z, c, use_reentrant=False)
+        else:
+            h, img0 = self.g0(z, c)
         fake_imgs = [img0]
         attn_maps = []
 
         for stage in self.stages:
-            h, img, attn = stage(h, word_embs)
+            if self.use_checkpoint:
+                h, img, attn = ckpt_fn(stage, h, word_embs, use_reentrant=False)
+            else:
+                h, img, attn = stage(h, word_embs)
             fake_imgs.append(img)
             attn_maps.append(attn)
 

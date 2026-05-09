@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from datasets import CUBDataset, collate_fn
 from damsm import RNN_ENCODER, CNN_ENCODER
 from losses import damsm_loss
-from utils import load_config, save_damsm, Logger
+from utils import load_config, save_damsm, Logger, apply_gpu_memory_config
 
 
 # ---------------------------------------------------------------------------
@@ -131,13 +131,14 @@ def train_damsm(cfg, device):
                              words_num=cfg.TEXT.WORDS_NUM,
                              captions_per_image=cfg.TEXT.CAPTIONS_PER_IMAGE)
 
+    nw = cfg.DAMSM.NUM_WORKERS
     train_loader = DataLoader(train_set, batch_size=cfg.DAMSM.BATCH_SIZE,
-                              shuffle=True,  num_workers=8, pin_memory=True,
-                              persistent_workers=True,
+                              shuffle=True,  num_workers=nw,
+                              pin_memory=(nw > 0), persistent_workers=(nw > 0),
                               collate_fn=damsm_collate, drop_last=True)
     test_loader  = DataLoader(test_set,  batch_size=cfg.DAMSM.BATCH_SIZE,
-                              shuffle=False, num_workers=8, pin_memory=True,
-                              persistent_workers=True,
+                              shuffle=False, num_workers=nw,
+                              pin_memory=(nw > 0), persistent_workers=(nw > 0),
                               collate_fn=damsm_collate, drop_last=True)
 
     n_words = train_set.n_words
@@ -245,4 +246,5 @@ if __name__ == '__main__':
         print('Warning: running on CPU — this will be slow.')
 
     print(f'Using device: {device}')
+    cfg = apply_gpu_memory_config(cfg, device)
     train_damsm(cfg, device)
