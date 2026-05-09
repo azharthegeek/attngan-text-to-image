@@ -69,7 +69,7 @@ mkdir -p data/birds
 # Unzip images into data/birds/images/
 
 # Download text annotations + train/test split pickles (Reed et al. format):
-# Option A — DF-GAN mirror (no account needed):
+# Option A - DF-GAN mirror (no account needed):
 pip install gdown
 bash scripts/download_birds_text.sh
 
